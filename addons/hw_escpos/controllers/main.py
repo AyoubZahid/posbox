@@ -18,6 +18,8 @@ import subprocess
 import traceback
 from threading import Thread, Lock
 from Queue import Queue, Empty
+import sys
+import socket
 
 try:
     import usb.core
@@ -44,8 +46,10 @@ class EscposDriver(Thread):
     def __init__(self):
         Thread.__init__(self)
         self.queue = Queue()
+        self.networkprinter = None
         self.lock  = Lock()
         self.status = {'status':'connecting', 'messages':[]}
+        self.printer_col =self.connected_devices()
 
     def supported_devices(self):
         if not os.path.isfile('escpos_devices.pickle'):
@@ -94,13 +98,83 @@ class EscposDriver(Thread):
                 f.close()
             except Exception as e:
                 self.set_status('error',str(e))
+    
+    def add_network_device(self,device_name,device_adress):
+        device_list = supported_devices.device_list[:]
+        if os.path.isfile('escpos_devices.pickle'):
+            try:
+                f = open('escpos_devices.pickle','r')
+                device_list = pickle.load(f)
+                f.close()
+            except Exception as e:
+                self.set_status('error',str(e))
+        device_list.append({
+            'vendor': 0000,
+            'product': 0000,
+            'name': device_name,
+            'ipadr': device_adress,
+        })
 
+        try:
+            f = open('escpos_devices.pickle','w+')
+            f.seek(0)
+            pickle.dump(device_list,f)
+            f.close()
+        except Exception as e:
+            self.set_status('error',str(e))
+    
+    def connected_devices(self):
+        return self.connected_usb_devices()+self.connected_network_devices()
+    
     def connected_usb_devices(self):
         connected = []
-        
+
+        # printers can either define bDeviceClass=7, or they can define one of
+        # their interfaces with bInterfaceClass=7. This class checks for both.
+        class FindUsbClass(object):
+            def __init__(self, usb_class):
+                self._class = usb_class
+            def __call__(self, device):
+                # first, let's check the device
+                if device.bDeviceClass == self._class:
+                    return True
+                # transverse all devices and look through their interfaces to
+                # find a matching class
+                for cfg in device:
+                    intf = usb.util.find_descriptor(cfg, bInterfaceClass=self._class)
+
+                    if intf is not None:
+                        return True
+
+                return False
+
+        printers = usb.core.find(find_all=True, custom_match=FindUsbClass(7))
+
+        for printer in printers:	
+            connected.append({
+                'vendor': printer.idVendor,
+                'product': printer.idProduct,
+                'name': usb.util.get_string(printer, 256, printer.iManufacturer) + " " + usb.util.get_string(printer, 256, printer.iProduct),
+		'type':'usb'
+            })
+
+        return connected
+    
+    def connected_network_devices(self):
+        connected = []
+
         for device in self.supported_devices():
-            if usb.core.find(idVendor=device['vendor'], idProduct=device['product']) != None:
-                connected.append(device)
+            if 'ipadr' in device.keys():
+		device['type']= 'network'
+                if 'connected' in device.keys():
+                    if device['connected']:
+                        connected.append(device)
+                else:
+                    hostname = device['ipadr']
+                    response = os.system("ping -c 1 -i 0.2 " + hostname)
+                    if response == 0:
+                        device['connected'] = True
+                        connected.append(device)
         return connected
 
     def lockedstart(self):
@@ -109,12 +183,35 @@ class EscposDriver(Thread):
                 self.daemon = True
                 self.start()
     
-    def get_escpos_printer(self):
+    def localhost(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 0))  # connecting to a UDP address doesn't send packets
+        local_ip_address = s.getsockname()[0]
+        return local_ip_address
+    
+    def get_escpos_printer(self , printer_adr = None):
         try:
-            printers = self.connected_usb_devices()
+            printers = self.connected_devices()
+            print "PRINTER_COL",printers
+            
+            if (printer_adr) :
+                if (printer_adr == self.localhost()):
+                    print "USB printer :", printers[0]
+                    return escpos.printer.Usb(printers[0]['vendor'], printers[0]['product'])
+                else :
+                    pr = next((p for p in printers if p.get('ipadr') == printer_adr or p.get('name') == printer_adr ), None)
+		    if pr:
+                    	print "NETWORK printer :", pr
+                    	return escpos.printer.Network(pr['ipadr'])
+		    else :
+			self.set_status('error',str('Printer with IP_ADRESS '+printer_adr+' Not found !!'))
+            
             if len(printers) > 0:
                 self.set_status('connected','Connected to '+printers[0]['name'])
-                return escpos.printer.Usb(printers[0]['vendor'], printers[0]['product'])
+		if printers[0]['type']=='usb':
+			return escpos.printer.Usb(printers[0]['vendor'], printers[0]['product'])
+		elif printers[0]['type']=='network':
+			return escpos.printer.Network(printers[0]['ipadr'])
             else:
                 self.set_status('disconnected','Printer Not Found')
                 return None
@@ -163,26 +260,33 @@ class EscposDriver(Thread):
             return
         while True:
             try:
-                timestamp, task, data = self.queue.get(True)
-
-                printer = self.get_escpos_printer()
+                timestamp, task, data , printer_adr = self.queue.get(True)
+                
+                printer = self.get_escpos_printer(printer_adr)
+                print "run printer",printer
 
                 if printer == None:
                     if task != 'status':
-                        self.queue.put((timestamp,task,data))
+                        self.queue.put((timestamp,task,data,printer_adr ))
                     time.sleep(5)
                     continue
                 elif task == 'receipt': 
-                    if timestamp >= time.time() - 1 * 60 * 60:
-                        self.print_receipt_body(printer,data)
-                        printer.cut()
+                    #if timestamp >= time.time() - 1 * 60 * 60:
+                    print('PRINTING RECEIPT')
+                    self.print_receipt_body(printer,data)
+                    printer.cut()
+
                 elif task == 'xml_receipt':
-                    if timestamp >= time.time() - 1 * 60 * 60:
-                        printer.receipt(data)
+                    #if timestamp >= time.time() - 1 * 60 * 60:
+                    print('PRINTING XML RECEIPT')
+                    printer.receipt(data)
+
                 elif task == 'cashbox':
-                    if timestamp >= time.time() - 12:
-                        self.open_cashbox(printer)
+                    print('TASK == cashbox')
+                    #if timestamp >= time.time() - 12:
+                    self.open_cashbox(printer)
                 elif task == 'printstatus':
+                    print('TASK == printstatus')
                     self.print_status(printer)
                 elif task == 'status':
                     pass
@@ -191,10 +295,15 @@ class EscposDriver(Thread):
                 self.set_status('error', str(e))
                 errmsg = str(e) + '\n' + '-'*60+'\n' + traceback.format_exc() + '-'*60 + '\n'
                 _logger.error(errmsg);
+	
+	    finally:
+	        if printer:
+	            printer.close()
 
-    def push_task(self,task, data = None):
+    def push_task(self,task, data = None, printer_adr = None):
+	print("push task",printer_adr)
         self.lockedstart()
-        self.queue.put((time.time(),task,data))
+        self.queue.put((time.time(),task,data,printer_adr))
 
     def print_status(self,eprint):
         localips = ['0.0.0.0','127.0.0.1','127.0.1.1']
@@ -364,15 +473,40 @@ class EscposProxy(hw_proxy.Proxy):
         driver.push_task('receipt',receipt)
 
     @http.route('/hw_proxy/print_xml_receipt', type='json', auth='none', cors='*')
-    def print_xml_receipt(self, receipt):
-        _logger.info('ESC/POS: PRINT XML RECEIPT') 
-        driver.push_task('xml_receipt',receipt)
+    def print_xml_receipt(self, receipt,printer = None):
+        _logger.info('ESC/POS: PRINT XML RECEIPT')
+	print ('/hw_proxy/print_xml_receipt :',printer)
+        driver.push_task('xml_receipt',receipt, printer)
 
     @http.route('/hw_proxy/escpos/add_supported_device', type='http', auth='none', cors='*')
     def add_supported_device(self, device_string):
         _logger.info('ESC/POS: ADDED NEW DEVICE:'+device_string) 
         driver.add_supported_device(device_string)
         return "The device:\n"+device_string+"\n has been added to the list of supported devices.<br/><a href='/hw_proxy/status'>Ok</a>"
+    
+    @http.route('/hw_proxy/escpos/add_network_device', type='http', auth='none', cors='*')
+    def add_network_device(self, device_name, device_adress):
+        _logger.info('ESC/POS: ADDED NETWORK DEVICE:'+device_name+'/'+device_adress)
+        driver.add_network_device(device_name,device_adress)
+        resp = """<style>
+        .device {
+            border-bottom: solid 1px rgb(216,216,216);
+            padding: 9px;
+        }
+        .device:nth-child(2n) {
+            background:rgb(240,240,240);
+        }
+        </style>
+        <div class='devices'>\n"""
+        
+        for device in driver.supported_devices():
+            vendor = str(device['vendor'])
+            product = str(device['product'])
+            name = device['name']
+            resp+= "<div class='device' data-device='"+name+"'>"+vendor+"-"+product+"-"+name
+            resp += "</div>\n"
+        return resp
+	
 
     @http.route('/hw_proxy/escpos/reset_supported_devices', type='http', auth='none', cors='*')
     def reset_supported_devices(self):

@@ -121,6 +121,14 @@ class Proxy(http.Controller):
                 <input type='text' style='width:400px' name='device_string' placeholder='123a:b456 Sample Device description' />
                 <input type='submit' value='submit' />
             </form>
+		<h2>Add Network ESC/POS Printer</h2>
+            <p>
+                <form action='/hw_proxy/escpos/add_network_device' method='GET'>
+                    <input type='text'  name='device_name' placeholder='Name' />
+                    <input type='text'  name='device_adress' placeholder='IP Adress Or Host Name' />
+                    <input type='submit' value='submit' />
+                </form>
+            </p>
             <h2>Reset To Defaults</h2>
             <p>If the added devices cause problems, you can <a href='/hw_proxy/escpos/reset_supported_devices'>Reset the
             device list to factory default.</a> This operation cannot be undone.</p>

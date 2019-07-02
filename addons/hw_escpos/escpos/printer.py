@@ -18,7 +18,7 @@ from exceptions import *
 class Usb(Escpos):
     """ Define USB printer """
 
-    def __init__(self, idVendor, idProduct, interface=0, in_ep=0x82, out_ep=0x01):
+    def __init__(self, idVendor, idProduct, interface=0, in_ep=None, out_ep=None):
         """
         @param idVendor  : Vendor ID
         @param idProduct : Product ID
@@ -26,32 +26,47 @@ class Usb(Escpos):
         @param in_ep     : Input end point
         @param out_ep    : Output end point
         """
+
+        self.errorText = "ERROR PRINTER\n\n\n\n\n\n"+PAPER_FULL_CUT
+
         self.idVendor  = idVendor
         self.idProduct = idProduct
         self.interface = interface
         self.in_ep     = in_ep
         self.out_ep    = out_ep
-	self.open()
+        self.open()
 
 
     def open(self):
         """ Search device on USB tree and set is as escpos device """
+        
         self.device = usb.core.find(idVendor=self.idVendor, idProduct=self.idProduct)
         if self.device is None:
-            print "Cable isn't plugged in"
-
-        if self.device.is_kernel_driver_active(0):
-            try:
-                self.device.detach_kernel_driver(0)
-            except usb.core.USBError as e:
-                print "Could not detatch kernel driver: %s" % str(e)
-
+            raise NoDeviceError()
         try:
+            if self.device.is_kernel_driver_active(self.interface):
+                self.device.detach_kernel_driver(self.interface) 
             self.device.set_configuration()
-            self.device.reset()
-        except usb.core.USBError as e:
-            print "Could not set configuration: %s" % str(e)
+            usb.util.claim_interface(self.device, self.interface)
 
+            cfg = self.device.get_active_configuration()
+            intf = cfg[(0,0)] # first interface
+            if self.in_ep is None:
+                # Attempt to detect IN/OUT endpoint addresses
+                try:
+                    is_IN = lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
+                    is_OUT = lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+                    endpoint_in = usb.util.find_descriptor(intf, custom_match=is_IN)
+                    endpoint_out = usb.util.find_descriptor(intf, custom_match=is_OUT)
+                    self.in_ep = endpoint_in.bEndpointAddress
+                    self.out_ep = endpoint_out.bEndpointAddress
+                except usb.core.USBError:
+                    # default values for officially supported printers
+                    self.in_ep = 0x82
+                    self.out_ep = 0x01
+
+        except usb.core.USBError as e:
+            raise HandleDeviceError(e)
 
     def _raw(self, msg):
         """ Print any command sent in raw format """
@@ -64,6 +79,12 @@ class Usb(Escpos):
             usb.util.dispose_resources(self.device)
         self.device = None
 
+    def close(self):
+        """ Release USB interface """
+        if self.device:
+            usb.util.dispose_resources(self.device)
+        self.device = None
+		
 
 
 class Serial(Escpos):
@@ -130,6 +151,9 @@ class Network(Escpos):
     def _raw(self, msg):
         self.device.send(msg)
 
+    def close(self):    
+        """ Close TCP connection """
+        self.device.close()
 
     def __del__(self):
         """ Close TCP connection """
